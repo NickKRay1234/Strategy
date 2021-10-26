@@ -109,16 +109,13 @@ namespace Mirror.Experimental
         public DataPoint start = new DataPoint();
         public DataPoint goal = new DataPoint();
 
-        // We need to store this locally on the server so clients can't request Authority when ever they like
-        bool clientAuthorityBeforeTeleport;
-
         void FixedUpdate()
         {
             // if server then always sync to others.
             // let the clients know that this has moved
             if (isServer && HasEitherMovedRotatedScaled())
             {
-                ServerUpdate();
+                RpcMove(targetTransform.localPosition, targetTransform.localRotation, targetTransform.localScale);
             }
 
             if (isClient)
@@ -127,49 +124,35 @@ namespace Mirror.Experimental
                 // -> only if connectionToServer has been initialized yet too
                 if (IsOwnerWithClientAuthority)
                 {
-                    ClientAuthorityUpdate();
+                    if (!isServer && HasEitherMovedRotatedScaled())
+                    {
+                        // serialize
+                        // local position/rotation for VR support
+                        // send to server
+                        CmdClientToServerSync(targetTransform.localPosition, targetTransform.localRotation, targetTransform.localScale);
+                    }
                 }
                 else if (goal.isValid)
                 {
-                    ClientRemoteUpdate();
+                    // teleport or interpolate
+                    if (NeedsTeleport())
+                    {
+                        // local position/rotation for VR support
+                        ApplyPositionRotationScale(goal.localPosition, goal.localRotation, goal.localScale);
+
+                        // reset data points so we don't keep interpolating
+                        start = new DataPoint();
+                        goal = new DataPoint();
+                    }
+                    else
+                    {
+                        // local position/rotation for VR support
+                        ApplyPositionRotationScale(InterpolatePosition(start, goal, targetTransform.localPosition),
+                                                   InterpolateRotation(start, goal, targetTransform.localRotation),
+                                                   InterpolateScale(start, goal, targetTransform.localScale));
+                    }
+
                 }
-            }
-        }
-
-        void ServerUpdate()
-        {
-            RpcMove(targetTransform.localPosition, Compression.CompressQuaternion(targetTransform.localRotation), targetTransform.localScale);
-        }
-
-        void ClientAuthorityUpdate()
-        {
-            if (!isServer && HasEitherMovedRotatedScaled())
-            {
-                // serialize
-                // local position/rotation for VR support
-                // send to server
-                CmdClientToServerSync(targetTransform.localPosition, Compression.CompressQuaternion(targetTransform.localRotation), targetTransform.localScale);
-            }
-        }
-
-        void ClientRemoteUpdate()
-        {
-            // teleport or interpolate
-            if (NeedsTeleport())
-            {
-                // local position/rotation for VR support
-                ApplyPositionRotationScale(goal.localPosition, goal.localRotation, goal.localScale);
-
-                // reset data points so we don't keep interpolating
-                start = new DataPoint();
-                goal = new DataPoint();
-            }
-            else
-            {
-                // local position/rotation for VR support
-                ApplyPositionRotationScale(InterpolatePosition(start, goal, targetTransform.localPosition),
-                                           InterpolateRotation(start, goal, targetTransform.localRotation),
-                                           InterpolateScale(start, goal, targetTransform.localScale));
             }
         }
 
@@ -212,30 +195,30 @@ namespace Mirror.Experimental
         }
 
         // local authority client sends sync message to server for broadcasting
-        [Command(channel = Channels.Unreliable)]
-        void CmdClientToServerSync(Vector3 position, uint packedRotation, Vector3 scale)
+        [Command]
+        void CmdClientToServerSync(Vector3 position, Quaternion rotation, Vector3 scale)
         {
             // Ignore messages from client if not in client authority mode
             if (!clientAuthority)
                 return;
 
             // deserialize payload
-            SetGoal(position, Compression.DecompressQuaternion(packedRotation), scale);
+            SetGoal(position, rotation, scale);
 
             // server-only mode does no interpolation to save computations, but let's set the position directly
             if (isServer && !isClient)
                 ApplyPositionRotationScale(goal.localPosition, goal.localRotation, goal.localScale);
 
-            RpcMove(position, packedRotation, scale);
+            RpcMove(position, rotation, scale);
         }
 
-        [ClientRpc(channel = Channels.Unreliable)]
-        void RpcMove(Vector3 position, uint packedRotation, Vector3 scale)
+        [ClientRpc]
+        void RpcMove(Vector3 position, Quaternion rotation, Vector3 scale)
         {
             if (hasAuthority && excludeOwnerUpdate) return;
 
             if (!isServer)
-                SetGoal(position, Compression.DecompressQuaternion(packedRotation), scale);
+                SetGoal(position, rotation, scale);
         }
 
         // serialization is needed by OnSerialize and by manual sending from authority
@@ -405,88 +388,6 @@ namespace Mirror.Experimental
             }
             return 1;
         }
-
-        #region Server Teleport (force move player)
-
-        /// <summary>
-        /// This method will override this GameObject's current Transform.localPosition to the specified Vector3  and update all clients.
-        /// <para>NOTE: position must be in LOCAL space if the transform has a parent</para>
-        /// </summary>
-        /// <param name="localPosition">Where to teleport this GameObject</param>
-        [Server]
-        public void ServerTeleport(Vector3 localPosition)
-        {
-            Quaternion localRotation = targetTransform.localRotation;
-            ServerTeleport(localPosition, localRotation);
-        }
-
-        /// <summary>
-        /// This method will override this GameObject's current Transform.localPosition and Transform.localRotation
-        /// to the specified Vector3 and Quaternion and update all clients.
-        /// <para>NOTE: localPosition must be in LOCAL space if the transform has a parent</para>
-        /// <para>NOTE: localRotation must be in LOCAL space if the transform has a parent</para>
-        /// </summary>
-        /// <param name="localPosition">Where to teleport this GameObject</param>
-        /// <param name="localRotation">Which rotation to set this GameObject</param>
-        [Server]
-        public void ServerTeleport(Vector3 localPosition, Quaternion localRotation)
-        {
-            // To prevent applying the position updates received from client (if they have ClientAuth) while being teleported.
-            // clientAuthorityBeforeTeleport defaults to false when not teleporting, if it is true then it means that teleport
-            // was previously called but not finished therefore we should keep it as true so that 2nd teleport call doesn't clear authority
-            clientAuthorityBeforeTeleport = clientAuthority || clientAuthorityBeforeTeleport;
-            clientAuthority = false;
-
-            DoTeleport(localPosition, localRotation);
-
-            // tell all clients about new values
-            RpcTeleport(localPosition, Compression.CompressQuaternion(localRotation), clientAuthorityBeforeTeleport);
-        }
-
-        void DoTeleport(Vector3 newLocalPosition, Quaternion newLocalRotation)
-        {
-            targetTransform.localPosition = newLocalPosition;
-            targetTransform.localRotation = newLocalRotation;
-
-            // Since we are overriding the position we don't need a goal and start.
-            // Reset them to null for fresh start
-            goal = new DataPoint();
-            start = new DataPoint();
-            lastPosition = newLocalPosition;
-            lastRotation = newLocalRotation;
-        }
-
-        [ClientRpc(channel = Channels.Unreliable)]
-        void RpcTeleport(Vector3 newPosition, uint newPackedRotation, bool isClientAuthority)
-        {
-            DoTeleport(newPosition, Compression.DecompressQuaternion(newPackedRotation));
-
-            // only send finished if is owner and is ClientAuthority on server 
-            if (hasAuthority && isClientAuthority)
-                CmdTeleportFinished();
-        }
-
-        /// <summary>
-        /// This RPC will be invoked on server after client finishes overriding the position.
-        /// </summary>
-        /// <param name="initialAuthority"></param>
-        [Command(channel = Channels.Unreliable)]
-        void CmdTeleportFinished()
-        {
-            if (clientAuthorityBeforeTeleport)
-            {
-                clientAuthority = true;
-
-                // reset value so doesn't effect future calls, see note in ServerTeleport
-                clientAuthorityBeforeTeleport = false;
-            }
-            else
-            {
-                Debug.LogWarning("Client called TeleportFinished when clientAuthority was false on server", this);
-            }
-        }
-
-        #endregion
 
         #region Debug Gizmos
 

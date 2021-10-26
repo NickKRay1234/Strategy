@@ -8,7 +8,6 @@ namespace Mirror.Examples.Tanks
         [Header("Components")]
         public NavMeshAgent agent;
         public Animator animator;
-        public TextMesh healthBar;
 
         [Header("Movement")]
         public float rotationSpeed = 100;
@@ -18,33 +17,54 @@ namespace Mirror.Examples.Tanks
         public GameObject projectilePrefab;
         public Transform projectileMount;
 
-        [Header("Stats")]
-        [SyncVar] public int health = 4;
+        [Header("Game Stats")]
+        [SyncVar]
+        public int health;
+        [SyncVar]
+        public int score;
+        [SyncVar]
+        public string playerName;
+        [SyncVar]
+        public bool allowMovement;
+        [SyncVar]
+        public bool isReady;
+
+        public bool isDead => health <= 0;
+        public TextMesh nameText;
+
 
         void Update()
         {
-            // always update health bar.
-            // (SyncVar hook would only update on clients, not on server)
-            healthBar.text = new string('-', health);
+            nameText.text = playerName;
+            nameText.transform.rotation = Camera.main.transform.rotation;
 
             // movement for local player
-            if (isLocalPlayer)
+            if (!isLocalPlayer)
+                return;
+
+            //Set local players name color to green
+            nameText.color = Color.green;
+
+            if (!allowMovement)
+                return;
+
+            if (isDead)
+                return;
+
+            // rotate
+            float horizontal = Input.GetAxis("Horizontal");
+            transform.Rotate(0, horizontal * rotationSpeed * Time.deltaTime, 0);
+
+            // move
+            float vertical = Input.GetAxis("Vertical");
+            Vector3 forward = transform.TransformDirection(Vector3.forward);
+            agent.velocity = forward * Mathf.Max(vertical, 0) * agent.speed;
+            animator.SetBool("Moving", agent.velocity != Vector3.zero);
+
+            // shoot
+            if (Input.GetKeyDown(shootKey))
             {
-                // rotate
-                float horizontal = Input.GetAxis("Horizontal");
-                transform.Rotate(0, horizontal * rotationSpeed * Time.deltaTime, 0);
-
-                // move
-                float vertical = Input.GetAxis("Vertical");
-                Vector3 forward = transform.TransformDirection(Vector3.forward);
-                agent.velocity = forward * Mathf.Max(vertical, 0) * agent.speed;
-                animator.SetBool("Moving", agent.velocity != Vector3.zero);
-
-                // shoot
-                if (Input.GetKeyDown(shootKey))
-                {
-                    CmdFire();
-                }
+                CmdFire();
             }
         }
 
@@ -53,6 +73,7 @@ namespace Mirror.Examples.Tanks
         void CmdFire()
         {
             GameObject projectile = Instantiate(projectilePrefab, projectileMount.position, transform.rotation);
+            projectile.GetComponent<Projectile>().source = gameObject;
             NetworkServer.Spawn(projectile);
             RpcOnFire();
         }
@@ -64,15 +85,27 @@ namespace Mirror.Examples.Tanks
             animator.SetTrigger("Shoot");
         }
 
-        [ServerCallback]
-        void OnTriggerEnter(Collider other)
+        public void SendReadyToServer(string playername)
         {
-            if (other.GetComponent<Projectile>() != null)
+            if (!isLocalPlayer)
+                return;
+
+            CmdReady(playername);
+        }
+
+        [Command]
+        void CmdReady(string playername)
+        {
+            if (string.IsNullOrEmpty(playername))
             {
-                --health;
-                if (health == 0)
-                    NetworkServer.Destroy(gameObject);
+                playerName = "PLAYER" + Random.Range(1, 99);
             }
+            else
+            {
+                playerName = playername;
+            }
+
+            isReady = true;
         }
     }
 }

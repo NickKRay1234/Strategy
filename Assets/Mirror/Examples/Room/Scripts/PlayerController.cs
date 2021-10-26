@@ -2,32 +2,36 @@ using UnityEngine;
 
 namespace Mirror.Examples.NetworkRoom
 {
-    [RequireComponent(typeof(CapsuleCollider))]
     [RequireComponent(typeof(CharacterController))]
     [RequireComponent(typeof(NetworkTransform))]
+    [RequireComponent(typeof(CapsuleCollider))]
     [RequireComponent(typeof(Rigidbody))]
     public class PlayerController : NetworkBehaviour
     {
         public CharacterController characterController;
+        public CapsuleCollider capsuleCollider;
 
         void OnValidate()
         {
             if (characterController == null)
                 characterController = GetComponent<CharacterController>();
+            if (capsuleCollider == null)
+                capsuleCollider = GetComponent<CapsuleCollider>();
+        }
 
-            characterController.enabled = false;
-            GetComponent<Rigidbody>().isKinematic = true;
-            GetComponent<NetworkTransform>().clientAuthority = true;
+        void Start()
+        {
+            capsuleCollider.enabled = isServer;
         }
 
         public override void OnStartLocalPlayer()
         {
+            characterController.enabled = true;
+
             Camera.main.orthographic = false;
             Camera.main.transform.SetParent(transform);
             Camera.main.transform.localPosition = new Vector3(0f, 3f, -8f);
             Camera.main.transform.localEulerAngles = new Vector3(10f, 0f, 0f);
-
-            characterController.enabled = true;
         }
 
         void OnDisable()
@@ -57,7 +61,7 @@ namespace Mirror.Examples.NetworkRoom
 
         void Update()
         {
-            if (!isLocalPlayer || characterController == null || !characterController.enabled)
+            if (!isLocalPlayer)
                 return;
 
             horizontal = Input.GetAxis("Horizontal");
@@ -89,7 +93,7 @@ namespace Mirror.Examples.NetworkRoom
 
         void FixedUpdate()
         {
-            if (!isLocalPlayer || characterController == null || !characterController.enabled)
+            if (!isLocalPlayer || characterController == null)
                 return;
 
             transform.Rotate(0f, turn * Time.fixedDeltaTime, 0f);

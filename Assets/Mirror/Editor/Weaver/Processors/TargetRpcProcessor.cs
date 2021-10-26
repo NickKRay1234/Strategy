@@ -3,56 +3,51 @@ using Mono.CecilX.Cil;
 
 namespace Mirror.Weaver
 {
-    // Processes [TargetRpc] methods in NetworkBehaviour
+    /// <summary>
+    /// Processes [TargetRpc] methods in NetworkBehaviour
+    /// </summary>
     public static class TargetRpcProcessor
     {
         // helper functions to check if the method has a NetworkConnection parameter
         public static bool HasNetworkConnectionParameter(MethodDefinition md)
         {
             return md.Parameters.Count > 0 &&
-                   md.Parameters[0].ParameterType.Is<NetworkConnection>();
+                   md.Parameters[0].ParameterType.FullName == Weaver.NetworkConnectionType.FullName;
         }
 
-        public static MethodDefinition ProcessTargetRpcInvoke(WeaverTypes weaverTypes, Readers readers, Logger Log, TypeDefinition td, MethodDefinition md, MethodDefinition rpcCallFunc, ref bool WeavingFailed)
+        public static MethodDefinition ProcessTargetRpcInvoke(TypeDefinition td, MethodDefinition md, MethodDefinition rpcCallFunc)
         {
             MethodDefinition rpc = new MethodDefinition(Weaver.InvokeRpcPrefix + md.Name, MethodAttributes.Family |
                     MethodAttributes.Static |
                     MethodAttributes.HideBySig,
-                weaverTypes.Import(typeof(void)));
+                    Weaver.voidType);
 
             ILProcessor worker = rpc.Body.GetILProcessor();
             Instruction label = worker.Create(OpCodes.Nop);
 
-            NetworkBehaviourProcessor.WriteClientActiveCheck(worker, weaverTypes, md.Name, label, "TargetRPC");
+            NetworkBehaviourProcessor.WriteClientActiveCheck(worker, md.Name, label, "TargetRPC");
 
             // setup for reader
-            worker.Emit(OpCodes.Ldarg_0);
-            worker.Emit(OpCodes.Castclass, td);
+            worker.Append(worker.Create(OpCodes.Ldarg_0));
+            worker.Append(worker.Create(OpCodes.Castclass, td));
 
             // NetworkConnection parameter is optional
             if (HasNetworkConnectionParameter(md))
             {
-                // on server, the NetworkConnection parameter is a connection to client.
-                // when the rpc is invoked on the client, it still has the same
-                // function signature. we pass in the connection to server,
-                // which is cleaner than just passing null)
-                //NetworkClient.readyconnection
-                //
-                // TODO
-                // a) .connectionToServer = best solution. no doubt.
-                // b) NetworkClient.connection for now. add TODO to not use static later.
-                worker.Emit(OpCodes.Call, weaverTypes.NetworkClientConnectionReference);
+                // if call has NetworkConnection write clients connection as first arg 
+                //ClientScene.readyconnection
+                worker.Append(worker.Create(OpCodes.Call, Weaver.ReadyConnectionReference));
             }
 
             // process reader parameters and skip first one if first one is NetworkConnection
-            if (!NetworkBehaviourProcessor.ReadArguments(md, readers, Log, worker, RemoteCallType.TargetRpc, ref WeavingFailed))
+            if (!NetworkBehaviourProcessor.ReadArguments(md, worker, RemoteCallType.TargetRpc))
                 return null;
 
             // invoke actual command function
-            worker.Emit(OpCodes.Callvirt, rpcCallFunc);
-            worker.Emit(OpCodes.Ret);
+            worker.Append(worker.Create(OpCodes.Callvirt, rpcCallFunc));
+            worker.Append(worker.Create(OpCodes.Ret));
 
-            NetworkBehaviourProcessor.AddInvokeParameters(weaverTypes, rpc.Parameters);
+            NetworkBehaviourProcessor.AddInvokeParameters(rpc.Parameters);
             td.Methods.Add(rpc);
             return rpc;
         }
@@ -90,50 +85,67 @@ namespace Mirror.Weaver
             correctly in dependent assemblies
 
         */
-        public static MethodDefinition ProcessTargetRpcCall(WeaverTypes weaverTypes, Writers writers, Logger Log, TypeDefinition td, MethodDefinition md, CustomAttribute targetRpcAttr, ref bool WeavingFailed)
+        public static MethodDefinition ProcessTargetRpcCall(TypeDefinition td, MethodDefinition md, CustomAttribute targetRpcAttr)
         {
-            MethodDefinition rpc = MethodProcessor.SubstituteMethod(Log, td, md, ref WeavingFailed);
+            MethodDefinition rpc = MethodProcessor.SubstituteMethod(td, md);
 
             ILProcessor worker = md.Body.GetILProcessor();
 
-            NetworkBehaviourProcessor.WriteSetupLocals(worker, weaverTypes);
+            NetworkBehaviourProcessor.WriteSetupLocals(worker);
 
-            NetworkBehaviourProcessor.WriteCreateWriter(worker, weaverTypes);
+            NetworkBehaviourProcessor.WriteCreateWriter(worker);
 
             // write all the arguments that the user passed to the TargetRpc call
             // (skip first one if first one is NetworkConnection)
-            if (!NetworkBehaviourProcessor.WriteArguments(worker, writers, Log, md, RemoteCallType.TargetRpc, ref WeavingFailed))
+            if (!NetworkBehaviourProcessor.WriteArguments(worker, md, RemoteCallType.TargetRpc))
                 return null;
 
             string rpcName = md.Name;
 
             // invoke SendInternal and return
             // this
-            worker.Emit(OpCodes.Ldarg_0);
+            worker.Append(worker.Create(OpCodes.Ldarg_0));
             if (HasNetworkConnectionParameter(md))
             {
                 // connection
-                worker.Emit(OpCodes.Ldarg_1);
+                worker.Append(worker.Create(OpCodes.Ldarg_1));
             }
             else
             {
                 // null
-                worker.Emit(OpCodes.Ldnull);
+                worker.Append(worker.Create(OpCodes.Ldnull));
             }
-            worker.Emit(OpCodes.Ldtoken, td);
+            worker.Append(worker.Create(OpCodes.Ldtoken, td));
             // invokerClass
-            worker.Emit(OpCodes.Call, weaverTypes.getTypeFromHandleReference);
-            worker.Emit(OpCodes.Ldstr, rpcName);
+            worker.Append(worker.Create(OpCodes.Call, Weaver.getTypeFromHandleReference));
+            worker.Append(worker.Create(OpCodes.Ldstr, rpcName));
             // writer
-            worker.Emit(OpCodes.Ldloc_0);
-            worker.Emit(OpCodes.Ldc_I4, targetRpcAttr.GetField("channel", 0));
-            worker.Emit(OpCodes.Callvirt, weaverTypes.sendTargetRpcInternal);
+            worker.Append(worker.Create(OpCodes.Ldloc_0));
+            worker.Append(worker.Create(OpCodes.Ldc_I4, targetRpcAttr.GetField("channel", 0)));
+            worker.Append(worker.Create(OpCodes.Callvirt, Weaver.sendTargetRpcInternal));
 
-            NetworkBehaviourProcessor.WriteRecycleWriter(worker, weaverTypes);
+            NetworkBehaviourProcessor.WriteRecycleWriter(worker);
 
-            worker.Emit(OpCodes.Ret);
+            worker.Append(worker.Create(OpCodes.Ret));
 
             return rpc;
+        }
+
+        public static bool ProcessMethodsValidateTargetRpc(MethodDefinition md)
+        {
+            if (md.IsStatic)
+            {
+                Weaver.Error($"{md.Name} must not be static", md);
+                return false;
+            }
+
+            if (!NetworkBehaviourProcessor.ProcessMethodsValidateFunction(md))
+            {
+                return false;
+            }
+
+            // validate
+            return NetworkBehaviourProcessor.ProcessMethodsValidateParameters(md, RemoteCallType.TargetRpc);
         }
     }
 }

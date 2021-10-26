@@ -1,16 +1,20 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 using UnityEngine;
 
 namespace Mirror
 {
     // a transport that can listen to multiple underlying transport at the same time
-    [DisallowMultipleComponent]
     public class MultiplexTransport : Transport
     {
         public Transport[] transports;
 
         Transport available;
+
+        // used to partition recipients for each one of the base transports
+        // without allocating a new list every time
+        List<int>[] recipientsCache;
 
         public void Awake()
         {
@@ -18,38 +22,8 @@ namespace Mirror
             {
                 Debug.LogError("Multiplex transport requires at least 1 underlying transport");
             }
-        }
-
-        public override void ClientEarlyUpdate()
-        {
-            foreach (Transport transport in transports)
-            {
-                transport.ClientEarlyUpdate();
-            }
-        }
-
-        public override void ServerEarlyUpdate()
-        {
-            foreach (Transport transport in transports)
-            {
-                transport.ServerEarlyUpdate();
-            }
-        }
-
-        public override void ClientLateUpdate()
-        {
-            foreach (Transport transport in transports)
-            {
-                transport.ClientLateUpdate();
-            }
-        }
-
-        public override void ServerLateUpdate()
-        {
-            foreach (Transport transport in transports)
-            {
-                transport.ServerLateUpdate();
-            }
+            InitClient();
+            InitServer();
         }
 
         void OnEnable()
@@ -82,6 +56,18 @@ namespace Mirror
         }
 
         #region Client
+        // clients always pick the first transport
+        void InitClient()
+        {
+            // wire all the base transports to my events
+            foreach (Transport transport in transports)
+            {
+                transport.OnClientConnected.AddListener(OnClientConnected.Invoke);
+                transport.OnClientDataReceived.AddListener(OnClientDataReceived.Invoke);
+                transport.OnClientError.AddListener(OnClientError.Invoke);
+                transport.OnClientDisconnected.AddListener(OnClientDisconnected.Invoke);
+            }
+        }
 
         public override void ClientConnect(string address)
         {
@@ -90,10 +76,6 @@ namespace Mirror
                 if (transport.Available())
                 {
                     available = transport;
-                    transport.OnClientConnected = OnClientConnected;
-                    transport.OnClientDataReceived = OnClientDataReceived;
-                    transport.OnClientError = OnClientError;
-                    transport.OnClientDisconnected = OnClientDisconnected;
                     transport.ClientConnect(address);
                     return;
                 }
@@ -109,12 +91,8 @@ namespace Mirror
                 {
                     try
                     {
-                        available = transport;
-                        transport.OnClientConnected = OnClientConnected;
-                        transport.OnClientDataReceived = OnClientDataReceived;
-                        transport.OnClientError = OnClientError;
-                        transport.OnClientDisconnected = OnClientDisconnected;
                         transport.ClientConnect(uri);
+                        available = transport;
                         return;
                     }
                     catch (ArgumentException)
@@ -137,9 +115,9 @@ namespace Mirror
                 available.ClientDisconnect();
         }
 
-        public override void ClientSend(ArraySegment<byte> segment, int channelId)
+        public override bool ClientSend(int channelId, ArraySegment<byte> segment)
         {
-            available.ClientSend(segment, channelId);
+            return available.ClientSend(channelId, segment);
         }
 
         #endregion
@@ -165,34 +143,38 @@ namespace Mirror
             return connectionId % transports.Length;
         }
 
-        void AddServerCallbacks()
+        void InitServer()
         {
+            recipientsCache = new List<int>[transports.Length];
+
             // wire all the base transports to my events
             for (int i = 0; i < transports.Length; i++)
             {
+                recipientsCache[i] = new List<int>();
+
                 // this is required for the handlers,  if I use i directly
                 // then all the handlers will use the last i
                 int locali = i;
                 Transport transport = transports[i];
 
-                transport.OnServerConnected = (baseConnectionId =>
+                transport.OnServerConnected.AddListener(baseConnectionId =>
                 {
                     OnServerConnected.Invoke(FromBaseId(locali, baseConnectionId));
                 });
 
-                transport.OnServerDataReceived = (baseConnectionId, data, channel) =>
+                transport.OnServerDataReceived.AddListener((baseConnectionId, data, channel) =>
                 {
                     OnServerDataReceived.Invoke(FromBaseId(locali, baseConnectionId), data, channel);
-                };
+                });
 
-                transport.OnServerError = (baseConnectionId, error) =>
+                transport.OnServerError.AddListener((baseConnectionId, error) =>
                 {
                     OnServerError.Invoke(FromBaseId(locali, baseConnectionId), error);
-                };
-                transport.OnServerDisconnected = baseConnectionId =>
+                });
+                transport.OnServerDisconnected.AddListener(baseConnectionId =>
                 {
                     OnServerDisconnected.Invoke(FromBaseId(locali, baseConnectionId));
-                };
+                });
             }
         }
 
@@ -224,32 +206,45 @@ namespace Mirror
             return transports[transportId].ServerGetClientAddress(baseConnectionId);
         }
 
-        public override void ServerDisconnect(int connectionId)
+        public override bool ServerDisconnect(int connectionId)
         {
             int baseConnectionId = ToBaseId(connectionId);
             int transportId = ToTransportId(connectionId);
-            transports[transportId].ServerDisconnect(baseConnectionId);
+            return transports[transportId].ServerDisconnect(baseConnectionId);
         }
 
-        public override void ServerSend(int connectionId, ArraySegment<byte> segment, int channelId)
+        public override bool ServerSend(List<int> connectionIds, int channelId, ArraySegment<byte> segment)
         {
-            int baseConnectionId = ToBaseId(connectionId);
-            int transportId = ToTransportId(connectionId);
+            // the message may be for different transports,
+            // partition the recipients by transport
+            foreach (List<int> list in recipientsCache)
+            {
+                list.Clear();
+            }
 
+            foreach (int connectionId in connectionIds)
+            {
+                int baseConnectionId = ToBaseId(connectionId);
+                int transportId = ToTransportId(connectionId);
+                recipientsCache[transportId].Add(baseConnectionId);
+            }
+
+            bool result = true;
             for (int i = 0; i < transports.Length; ++i)
             {
-                if (i == transportId)
+                List<int> baseRecipients = recipientsCache[i];
+                if (baseRecipients.Count > 0)
                 {
-                    transports[i].ServerSend(baseConnectionId, segment, channelId);
+                    result &= transports[i].ServerSend(baseRecipients, channelId, segment);
                 }
             }
+            return result;
         }
 
         public override void ServerStart()
         {
             foreach (Transport transport in transports)
             {
-                AddServerCallbacks();
                 transport.ServerStart();
             }
         }

@@ -4,7 +4,11 @@ using UnityEngine;
 
 namespace Mirror.RemoteCalls
 {
-    // command function delegate
+    /// <summary>
+    /// Delegate for Command functions.
+    /// </summary>
+    /// <param name="obj"></param>
+    /// <param name="reader"></param>
     public delegate void CmdDelegate(NetworkBehaviour obj, NetworkReader reader, NetworkConnectionToClient senderConnection);
 
     class Invoker
@@ -12,7 +16,7 @@ namespace Mirror.RemoteCalls
         public Type invokeClass;
         public MirrorInvokeType invokeType;
         public CmdDelegate invokeFunction;
-        public bool cmdRequiresAuthority;
+        public bool cmdIgnoreAuthority;
 
         public bool AreEqual(Type invokeClass, MirrorInvokeType invokeType, CmdDelegate invokeFunction)
         {
@@ -24,14 +28,24 @@ namespace Mirror.RemoteCalls
 
     public struct CommandInfo
     {
-        public bool requiresAuthority;
+        public bool ignoreAuthority;
     }
 
-    /// <summary>Used to help manage remote calls for NetworkBehaviours</summary>
+    /// <summary>
+    /// Used to help manage remote calls for NetworkBehaviours
+    /// </summary>
     public static class RemoteCallHelper
     {
+        static readonly ILogger logger = LogFactory.GetLogger(typeof(RemoteCallHelper));
+
         static readonly Dictionary<int, Invoker> cmdHandlerDelegates = new Dictionary<int, Invoker>();
 
+        /// <summary>
+        /// Creates hash from Type and method name
+        /// </summary>
+        /// <param name="invokeClass"></param>
+        /// <param name="methodName"></param>
+        /// <returns></returns>
         internal static int GetMethodHash(Type invokeClass, string methodName)
         {
             // (invokeClass + ":" + cmdName).GetStableHashCode() would cause allocations.
@@ -43,7 +57,17 @@ namespace Mirror.RemoteCalls
             }
         }
 
-        internal static int RegisterDelegate(Type invokeClass, string cmdName, MirrorInvokeType invokerType, CmdDelegate func, bool cmdRequiresAuthority = true)
+
+        /// <summary>
+        /// helper function register a Command/Rpc/SyncEvent delegate
+        /// </summary>
+        /// <param name="invokeClass"></param>
+        /// <param name="cmdName"></param>
+        /// <param name="invokerType"></param>
+        /// <param name="func"></param>
+        /// <param name="cmdIgnoreAuthority"></param>
+        /// <returns>remote function hash</returns>
+        internal static int RegisterDelegate(Type invokeClass, string cmdName, MirrorInvokeType invokerType, CmdDelegate func, bool cmdIgnoreAuthority = false)
         {
             // type+func so Inventory.RpcUse != Equipment.RpcUse
             int cmdHash = GetMethodHash(invokeClass, cmdName);
@@ -56,13 +80,16 @@ namespace Mirror.RemoteCalls
                 invokeType = invokerType,
                 invokeClass = invokeClass,
                 invokeFunction = func,
-                cmdRequiresAuthority = cmdRequiresAuthority,
+                cmdIgnoreAuthority = cmdIgnoreAuthority,
             };
 
             cmdHandlerDelegates[cmdHash] = invoker;
 
-            //string ingoreAuthorityMessage = invokerType == MirrorInvokeType.Command ? $" requiresAuthority:{cmdRequiresAuthority}" : "";
-            //Debug.Log($"RegisterDelegate hash: {cmdHash} invokerType: {invokerType} method: {func.GetMethodName()}{ingoreAuthorityMessage}");
+            if (logger.LogEnabled())
+            {
+                string ingoreAuthorityMessage = invokerType == MirrorInvokeType.Command ? $" IgnoreAuthority:{cmdIgnoreAuthority}" : "";
+                logger.Log($"RegisterDelegate hash: {cmdHash} invokerType: {invokerType} method: {func.GetMethodName()}{ingoreAuthorityMessage}");
+            }
 
             return cmdHash;
         }
@@ -79,15 +106,15 @@ namespace Mirror.RemoteCalls
                     return true;
                 }
 
-                Debug.LogError($"Function {oldInvoker.invokeClass}.{oldInvoker.invokeFunction.GetMethodName()} and {invokeClass}.{func.GetMethodName()} have the same hash.  Please rename one of them");
+                logger.LogError($"Function {oldInvoker.invokeClass}.{oldInvoker.invokeFunction.GetMethodName()} and {invokeClass}.{func.GetMethodName()} have the same hash.  Please rename one of them");
             }
 
             return false;
         }
 
-        public static void RegisterCommandDelegate(Type invokeClass, string cmdName, CmdDelegate func, bool requiresAuthority)
+        public static void RegisterCommandDelegate(Type invokeClass, string cmdName, CmdDelegate func, bool ignoreAuthority)
         {
-            RegisterDelegate(invokeClass, cmdName, MirrorInvokeType.Command, func, requiresAuthority);
+            RegisterDelegate(invokeClass, cmdName, MirrorInvokeType.Command, func, ignoreAuthority);
         }
 
         public static void RegisterRpcDelegate(Type invokeClass, string rpcName, CmdDelegate func)
@@ -95,7 +122,21 @@ namespace Mirror.RemoteCalls
             RegisterDelegate(invokeClass, rpcName, MirrorInvokeType.ClientRpc, func);
         }
 
-        //  We need this in order to clean up tests
+        public static void RegisterEventDelegate(Type invokeClass, string eventName, CmdDelegate func)
+        {
+            RegisterDelegate(invokeClass, eventName, MirrorInvokeType.SyncEvent, func);
+        }
+
+        // we need a way to clean up delegates after tests
+        [System.Obsolete("Removing all delegates will cause problems with other tests as their hashs can not be re-added without reloading scripts", true)]
+        internal static void ClearDelegates()
+        {
+            cmdHandlerDelegates.Clear();
+        }
+
+        /// <summary>
+        /// We need this in order to clean up tests
+        /// </summary>
         internal static void RemoveDelegate(int hash)
         {
             cmdHandlerDelegates.Remove(hash);
@@ -111,16 +152,18 @@ namespace Mirror.RemoteCalls
             // debug message if not found, or null, or mismatched type
             // (no need to throw an error, an attacker might just be trying to
             //  call an cmd with an rpc's hash)
-            // Debug.Log($"GetInvokerForHash hash {cmdHash} not found");
+            if (logger.LogEnabled()) logger.Log("GetInvokerForHash hash:" + cmdHash + " not found");
+
             return false;
         }
 
-        // InvokeCmd/Rpc Delegate can all use the same function here
+        // InvokeCmd/Rpc/SyncEventDelegate can all use the same function here
         internal static bool InvokeHandlerDelegate(int cmdHash, MirrorInvokeType invokeType, NetworkReader reader, NetworkBehaviour invokingType, NetworkConnectionToClient senderConnection = null)
         {
             if (GetInvokerForHash(cmdHash, invokeType, out Invoker invoker) && invoker.invokeClass.IsInstanceOfType(invokingType))
             {
                 invoker.invokeFunction(invokingType, reader, senderConnection);
+
                 return true;
             }
             return false;
@@ -132,13 +175,18 @@ namespace Mirror.RemoteCalls
             {
                 return new CommandInfo
                 {
-                    requiresAuthority = invoker.cmdRequiresAuthority
+                    ignoreAuthority = invoker.cmdIgnoreAuthority
                 };
             }
             return default;
         }
 
-        /// <summary>Gets the handler function by hash. Useful for profilers and debuggers.</summary>
+        /// <summary>
+        /// Gets the handler function for a given hash
+        /// Can be used by profilers and debuggers
+        /// </summary>
+        /// <param name="cmdHash">rpc function hash</param>
+        /// <returns>The function delegate that will handle the command</returns>
         public static CmdDelegate GetDelegate(int cmdHash)
         {
             if (cmdHandlerDelegates.TryGetValue(cmdHash, out Invoker invoker))

@@ -2,8 +2,7 @@
     "name": "Mirror",
     "references": [
         "Mirror.CompilerSymbols",
-        "Telepathy",
-        "kcp2k"
+        "Ninja.WebSockets"
     ],
     "optionalUnityReferences": [],
     "includePlatforms": [],
